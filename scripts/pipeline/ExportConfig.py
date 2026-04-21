@@ -49,7 +49,7 @@ class ExportConfig:
     prodes_hydro_fc: str = "users/guilhermeteix2016/prodes_hydrography"
 
     # Naming helper for label exports
-    prefix: str = "sinop"
+    prefix: str = "sinop_scene"
 
     def validate(self) -> None:
         """Basic sanity checks on the configuration values."""
