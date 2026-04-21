@@ -8,7 +8,7 @@
 
 ## Overview
 
-This thesis investigates how Vision-Language Models (VLMs) generalise to remote sensing imagery for deforestation analysis in the Amazon biome. It covers zero/one-shot evaluation of state-of-the-art VLMs across image captioning, VQA, object detection, and change detection — followed by supervised fine-tuning of the best-performing model on a purpose-built multimodal dataset. Ultimately, the a new from scratch VLM will be developed specifically for this domain.
+This thesis investigates how Vision-Language Models (VLMs) generalise to remote sensing imagery for deforestation analysis in the Amazon biome. It covers zero/one-shot evaluation of state-of-the-art VLMs across image captioning, VQA, object detection, and change detection — followed by supervised fine-tuning of the best-performing model on a purpose-built multimodal dataset. Ultimately, a new from scratch VLM will be developed specifically for this domain.
 
 ---
 
