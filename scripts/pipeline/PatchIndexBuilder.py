@@ -5,6 +5,7 @@ from typing import Callable, Dict
 
 import numpy as np
 import rasterio
+import shutil
 
 
 IGNORE = 255
@@ -48,6 +49,12 @@ class PatchIndexBuilder:
             for i, pdir in enumerate(patch_dirs, 1):
                 img_path, lbl_path = self._patch_paths(pdir)
                 if not img_path.exists() or not lbl_path.exists():
+                    # missing files: delete the patch directory to keep dataset clean
+                    try:
+                        shutil.rmtree(pdir)
+                        print(f"Deleted patch directory (missing files): {pdir}")
+                    except Exception as e:
+                        print(f"Warning: failed to delete {pdir}: {e}")
                     dropped += 1
                     continue
 
@@ -57,6 +64,12 @@ class PatchIndexBuilder:
                 self._accumulate_counts(global_counts_all, counts)
 
                 if valid_frac < self.min_lbl_valid_frac:
+                    # low-valid-label patch: delete the patch directory to avoid keeping unusable patches
+                    try:
+                        shutil.rmtree(pdir)
+                        print(f"Deleted patch directory (low valid fraction={valid_frac:.3f}): {pdir}")
+                    except Exception as e:
+                        print(f"Warning: failed to delete {pdir}: {e}")
                     dropped += 1
                     self._accumulate_counts(global_counts_dropped, counts)
                     continue
@@ -175,7 +188,7 @@ class PatchIndexBuilder:
                     records[pid] = rec
         return records
 
-    def update_records(self, transform: Callable[[Dict], Dict]) -> None:
+    def update_records(self, transform: Callable[[Dict], Dict]) -> int:
         """Apply *transform* to every record in the JSONL index and rewrite it.
 
         This is the single write-back hook used by captions, QA, and
