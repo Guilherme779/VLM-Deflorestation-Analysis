@@ -3,45 +3,19 @@
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import numpy as np
 import rasterio
 import math
 from MapBiomasClasses import MapBiomasClasses
 from PatchIndexBuilder import PatchIndexBuilder
 
-try:
-    from scipy.ndimage import label as nd_label, binary_erosion as nd_binary_erosion
-except Exception:
-    nd_label = None
-    nd_binary_erosion = None
-
-
-@dataclass
-class CaptionConfig:
-    min_dominant_frac: float = 0.5
-    min_secondary_frac: float = 0.01
-    max_secondary: int = 3
-    no_spatial: bool = False
-
-
 @dataclass
 class SpatialStats:
     pixel_count: int
-    n_cc: int
-    largest_cc_frac: float
-    median_cc_patch_frac: float
-    p90_cc_patch_frac: float
-    small_cc_area_frac: float
-    small_cc_share: float
-    n_small_cc_patch: int
-    n_large_cc_patch: int
     centroid_y: float
     centroid_x: float
-    var_x: float
-    var_y: float
-    elongation: float
-    contact_ratio: float
+    locations: List[str]
 
 class PatchCaptionGenerator:
     """Generate and attach captions to patches.
@@ -52,13 +26,9 @@ class PatchCaptionGenerator:
         *,
         patch_root: Path,
         index_builder: PatchIndexBuilder,
-        config: Optional[CaptionConfig] = None,
     ) -> None:
         self.patch_root = patch_root
         self.index_builder = index_builder
-        self.config = config or CaptionConfig()
-
-    # ---- low-level helpers ----
 
     @staticmethod
     def _load_label(label_path: Path) -> np.ndarray:
@@ -66,338 +36,238 @@ class PatchCaptionGenerator:
             return src.read(1)
 
     @staticmethod
-    def _percent(frac: float) -> int:
-        return int(round(frac * 100.0))
-
-    @staticmethod
-    def _verb_for_label(label: str) -> str:
-        return "are" if label.endswith("areas") else "is"
-
-    @staticmethod
-    def _connected_components_8(mask: np.ndarray) -> List[int]:
-        h, w = mask.shape
-        visited = np.zeros_like(mask, dtype=bool)
-        sizes: List[int] = []
-        for y in range(h):
-            for x in range(w):
-                if not mask[y, x] or visited[y, x]:
-                    continue
-                stack = [(y, x)]
-                visited[y, x] = True
-                size = 0
-                while stack:
-                    cy, cx = stack.pop()
-                    size += 1
-                    for ny in (cy - 1, cy, cy + 1):
-                        if ny < 0 or ny >= h:
-                            continue
-                        for nx in (cx - 1, cx + 1):
-                            if nx < 0 or nx >= w:
-                                continue
-                            if not mask[ny, nx] or visited[ny, nx]:
-                                continue
-                            visited[ny, nx] = True
-                            stack.append((ny, nx))
-                sizes.append(size)
-        return sizes
+    def _percent(class_fraction: float) -> int:
+        return int(round(class_fraction * 100.0))
 
     def analyze_class_spatial(
         self,
         mask: np.ndarray,
-        *,
-        valid_pixel_count: int,
-        lbl: Optional[np.ndarray] = None,
-        class_idx: Optional[int] = None,
-        valid_mask: Optional[np.ndarray] = None,
     ) -> Optional[SpatialStats]:
         pixel_count = int(mask.sum())
         if pixel_count == 0:
             return None
 
-        h, w = mask.shape
-        if nd_label is not None:
-            structure = np.ones((3, 3), dtype=np.int8)
-            labels, n_cc = nd_label(mask, structure=structure)
-            if n_cc > 0:
-                sizes = np.bincount(labels.ravel())[1:]
-                sizes = sizes[sizes > 0]
-                sizes_list = sizes.tolist()
-            else:
-                sizes_list = []
-        else:
-            sizes_list = self._connected_components_8(mask)
-            n_cc = len(sizes_list)
-
-        largest_cc = max(sizes_list) if sizes_list else 0
-        largest_cc_frac = float(largest_cc) / float(pixel_count)
-
-        valid_denom = max(int(valid_pixel_count), 1)
-        if sizes_list:
-            cc_fracs = np.array(sizes_list, dtype=np.float64) / float(pixel_count)
-            cc_patch_fracs = np.array(sizes_list, dtype=np.float64) / float(valid_denom)
-            median_cc_patch_frac = float(np.median(cc_patch_fracs))
-            p90_cc_patch_frac = float(np.percentile(cc_patch_fracs, 90))
-            sizes_arr = np.array(sizes_list, dtype=np.float64)
-            small_mask = (sizes_arr <= 32) | (cc_patch_fracs < 0.002)
-            large_mask = (cc_patch_fracs >= 0.02) | (sizes_arr >= (0.10 * float(pixel_count)))
-            n_small_cc_patch = int(small_mask.sum())
-            n_large_cc_patch = int(large_mask.sum())
-            small_cc_area_frac = float(cc_fracs[small_mask].sum()) if n_small_cc_patch > 0 else 0.0
-            small_cc_share = float(n_small_cc_patch) / float(max(n_cc, 1))
-        else:
-            median_cc_patch_frac = 0.0
-            p90_cc_patch_frac = 0.0
-            small_cc_area_frac = 0.0
-            small_cc_share = 0.0
-            n_small_cc_patch = 0
-            n_large_cc_patch = 0
+        height, width = mask.shape
 
         ys, xs = np.nonzero(mask)
-        cy = float(ys.mean()) / max(h - 1, 1)
-        cx = float(xs.mean()) / max(w - 1, 1)
+        centroid_y = float(ys.mean()) / max(height - 1, 1)
+        centroid_x = float(xs.mean()) / max(width - 1, 1)
 
-        x = xs.astype(np.float64) / max(w - 1, 1)
-        y = ys.astype(np.float64) / max(h - 1, 1)
-        mx = x.mean()
-        my = y.mean()
-        vx = float(np.mean((x - mx) ** 2))
-        vy = float(np.mean((y - my) ** 2))
-        cov = float(np.mean((x - mx) * (y - my)))
-        trace = vx + vy
-        det = max(vx * vy - cov * cov, 0.0)
-        disc = max(trace * trace - 4.0 * det, 0.0)
-        lambda_max = (trace + math.sqrt(disc)) / 2.0
-        lambda_min = max((trace - math.sqrt(disc)) / 2.0, 1e-12)
-        elongation = math.sqrt(lambda_max / lambda_min)
+        # Determine which 3x3 grid cells contain a meaningful share of the class
+        # Map pixels to cell indices 0..2 for y (rows) and x (cols)
+        # Use integer math on pixel coordinates rather than normalized centroids
+        y_cells = (ys * 3) // max(height, 1)
+        x_cells = (xs * 3) // max(width, 1)
+        y_cells = np.clip(y_cells, 0, 2)
+        x_cells = np.clip(x_cells, 0, 2)
 
-        contact_ratio = 0.0
-        if lbl is not None and class_idx is not None and valid_mask is not None:
-            contact_ratio = self._compute_contact_ratio(mask, lbl, valid_mask, class_idx)
+        counts: Dict[Tuple[int, int], int] = {}
+        for ry, rx in zip(y_cells, x_cells):
+            key = (int(ry), int(rx))
+            counts[key] = counts.get(key, 0) + 1
+
+        # Keep cells that contain at least 2% of the class pixels to avoid noise
+        significant = [(k, v) for k, v in counts.items() if (v / pixel_count) >= 0.02]
+        # If too many small cells pass the threshold, limit to the top N
+        significant.sort(key=lambda kv: kv[1], reverse=True)
+        MAX_CELLS_TO_REPORT = 3
+        # prefer spatially diverse cells: pick top cells but avoid immediate neighbors
+        selected: List[Tuple[int, int]] = []
+        for k, _ in significant:
+            if len(selected) >= MAX_CELLS_TO_REPORT:
+                break
+            r, c = k
+            too_close = False
+            for sr, sc in selected:
+                if abs(sr - r) + abs(sc - c) <= 1:
+                    too_close = True
+                    break
+            if not too_close:
+                selected.append(k)
+        # if we didn't pick enough diverse cells, fill with top ones
+        if len(selected) < MAX_CELLS_TO_REPORT:
+            for k, _ in significant:
+                if k not in selected:
+                    selected.append(k)
+                if len(selected) >= MAX_CELLS_TO_REPORT:
+                    break
+        loc_cells = selected
+
+        locations: List[str] = self._compress_locations(loc_cells)
 
         return SpatialStats(
             pixel_count=pixel_count,
-            n_cc=int(n_cc),
-            largest_cc_frac=float(largest_cc_frac),
-            median_cc_patch_frac=median_cc_patch_frac,
-            p90_cc_patch_frac=p90_cc_patch_frac,
-            small_cc_area_frac=small_cc_area_frac,
-            small_cc_share=small_cc_share,
-            n_small_cc_patch=n_small_cc_patch,
-            n_large_cc_patch=n_large_cc_patch,
-            centroid_y=float(cy),
-            centroid_x=float(cx),
-            var_x=float(vx),
-            var_y=float(vy),
-            elongation=float(elongation),
-            contact_ratio=float(contact_ratio),
+            centroid_y=float(centroid_y),
+            centroid_x=float(centroid_x),
+            locations=locations,
         )
-
-    def spatial_phrase_from_stats(self, stats: SpatialStats, *, dom_frac: Optional[float] = None) -> Optional[str]:
-        if stats.pixel_count == 0:
-            return None
-
-        n_cc = int(stats.n_cc)
-        largest_cc_frac = float(stats.largest_cc_frac)
-        small_cc_area_frac = float(stats.small_cc_area_frac)
-        n_large_cc_patch = int(stats.n_large_cc_patch)
-        small_cc_share = float(stats.small_cc_share)
-        median_patch = float(stats.median_cc_patch_frac)
-        p90_patch = float(stats.p90_cc_patch_frac)
-        elongation = float(stats.elongation)
-        var_x = float(stats.var_x)
-        var_y = float(stats.var_y)
-        contact_ratio = float(stats.contact_ratio)
-
-        if largest_cc_frac >= 0.95 and contact_ratio < 0.40:
-            structure = "a single contiguous region"
-        elif largest_cc_frac >= 0.85 and n_cc <= 5:
-            if contact_ratio >= 0.55:
-                structure = "a main region interwoven with other classes"
-            else:
-                structure = "a single main block"
-        elif largest_cc_frac >= 0.60 and n_cc <= 8:
-            structure = self._counted_structure("a few clustered regions", n_cc)
-        else:
-            if n_cc >= 6 and median_patch <= 0.0015 and p90_patch <= 0.01:
-                structure = self._counted_structure("scattered in small regions", n_cc)
-            elif (n_cc >= 8 and small_cc_share >= 0.70) or (small_cc_area_frac >= 0.55 and n_large_cc_patch == 0):
-                structure = self._counted_structure("scattered in small regions", n_cc)
-            elif n_cc >= 10:
-                structure = "scattered in many regions"
-            elif n_cc >= 5:
-                structure = self._counted_structure("scattered in multiple regions", n_cc)
-            else:
-                structure = self._counted_structure("multiple regions", n_cc)
-
-        shape = None
-        if elongation >= 3.0:
-            shape = "forming a linear band"
-        elif elongation <= 1.5 and (var_x + var_y) <= 0.02:
-            shape = "compact"
-
-        spread = var_x + var_y
-        concentrated = self._is_concentrated(stats, spread=spread)
-
-        location = None
-        if concentrated:
-            location = self._centroid_location_phrase(stats)
-
-        bits = [structure]
-        if shape:
-            bits.append(shape)
-        if location:
-            bits.append(location)
-
-        if dom_frac is not None and dom_frac < 0.75 and contact_ratio >= 0.55:
-            bits.append("with substantial intermixing")
-
-        phrase = ", ".join(bits)
-        return phrase.replace("across the patch", "across the image")
 
     def compute_stats_and_phrase(
         self,
         mask: np.ndarray,
-        *,
-        valid_pixel_count: int,
-        lbl: Optional[np.ndarray] = None,
-        class_idx: Optional[int] = None,
-        valid_mask: Optional[np.ndarray] = None,
-        dom_frac: Optional[float] = None,
-    ) -> Tuple[Optional[Dict[str, float | int]], Optional[str]]:
-        stats = self.analyze_class_spatial(
-            mask,
-            valid_pixel_count=valid_pixel_count,
-            lbl=lbl,
-            class_idx=class_idx,
-            valid_mask=valid_mask,
-        )
+    ) -> Tuple[Optional[Dict[str, float | int | List[str]]], Optional[str]]:
+        stats = self.analyze_class_spatial(mask)
         if stats is None:
             return None, None
-        phrase = self.spatial_phrase_from_stats(stats, dom_frac=dom_frac)
-        # Convert SpatialStats dataclass instance to a plain dict
-        stats_dict: Dict[str, float | int] = {k: float(v) if isinstance(v, float) else int(v) for k, v in asdict(stats).items()}
+        phrase = None
+        stats_dict: Dict[str, float | int | List[str]] = {
+            "pixel_count": int(stats.pixel_count),
+            "centroid_y": float(stats.centroid_y),
+            "centroid_x": float(stats.centroid_x),
+            "locations": list(stats.locations),
+        }
         return stats_dict, phrase
 
     def compute_spatial_stats(
         self,
         lbl: np.ndarray,
-        *,
-        valid_mask: np.ndarray,
-        valid_pixel_count: int,
-        dominant_class: str,
-        dominant_frac: float,
-    ) -> Tuple[Dict[str, Optional[Dict[str, float | int]]], Dict[str, str]]:
-        spatial_stats: Dict[str, Optional[Dict[str, float | int]]] = {}
-        spatial_phrases: Dict[str, str] = {}
+    ) -> Dict[str, Optional[Dict[str, float | int | List[str]]]]:
+        spatial_stats: Dict[str, Optional[Dict[str, float | int | List[str]]]] = {}
+        valid_mask = (lbl != MapBiomasClasses.IGNORE)
 
-        for idx, name in enumerate(MapBiomasClasses.CLASS_NAMES):
+        for idx, class_name in enumerate(MapBiomasClasses.CLASS_NAMES):
             mask = (lbl == idx) & valid_mask
-            stats_dict, phrase = self.compute_stats_and_phrase(
-                mask,
-                valid_pixel_count=valid_pixel_count,
-                lbl=lbl,
-                class_idx=idx,
-                valid_mask=valid_mask,
-                dom_frac=dominant_frac if name == dominant_class else None,
-            )
+            stats_dict, _ = self.compute_stats_and_phrase(mask)
             if stats_dict is not None:
-                spatial_stats[name] = stats_dict
-            if phrase:
-                spatial_phrases[name] = phrase
+                spatial_stats[class_name] = stats_dict
 
-        return spatial_stats, spatial_phrases
+        return spatial_stats
 
     def build_caption(
         self,
-        fracs: Dict[str, float],
-        spatial_phrases: Dict[str, str],
-    ) -> Tuple[str, Dict[str, float], List[str], Dict[str, str]]:
-        ordered = sorted(fracs.items(), key=lambda kv: kv[1], reverse=True)
-        dominant, dom_frac = ordered[0]
+        class_fractions: Dict[str, float],
+        spatial_stats: Dict[str, Optional[Dict[str, float | int | List[str]]]],
+    ) -> Tuple[str, Dict[str, float]]:
+        ordered = sorted(class_fractions.items(), key=lambda kv: kv[1], reverse=True)
+        classes_to_mention = self._filter_low_presence_classes(ordered)
 
-        forced = [
-            name
-            for name in ("water", "urban")
-            if name != dominant and fracs.get(name, 0.0) >= 0.01
+        #format class name and percentage to a readable format
+        class_info = [
+            f"{MapBiomasClasses.CLASS_LABELS.get(class_name, class_name)} (about {self._percent(class_fraction)}%)"
+            for class_name, class_fraction in classes_to_mention
         ]
-        max_total = min(self.config.max_secondary + len(forced), 4)
-        secondary = forced[:max_total]
-        remaining = [
-            name
-            for name, frac in ordered[1:]
-            if name not in secondary and frac >= self.config.min_secondary_frac
-        ]
-        secondary.extend(remaining[: max_total - len(secondary)])
+        first = f"Image composed by {self._format_list(class_info)},"
 
-        dom_label = MapBiomasClasses.CLASS_LABELS.get(dominant, dominant)
-        secondary_labels = [MapBiomasClasses.CLASS_LABELS.get(n, n) for n in secondary]
+        # 2) Location phrases: allow reporting multiple occupied cells when present
+        # First, collect per-class pixel counts and candidate locations.
+        class_pixel_counts: Dict[str, int] = {}
+        class_locs: Dict[str, List[str]] = {}
+        for class_name, _ in classes_to_mention:
+            stats = spatial_stats.get(class_name) or {}
+            if not isinstance(stats, dict):
+                raise ValueError(f"Expected spatial_stats for class '{class_name}' to be a dict, got {type(stats)}")
 
-        parts: List[str] = []
-        if dom_frac >= self.config.min_dominant_frac:
-            parts.append(f"The image is dominated by {dom_label} (about {self._percent(dom_frac)}%).")
-        else:
-            parts.append("The image shows mixed land cover.")
+            stats_pixel_count = stats.get("pixel_count")
+            if not isinstance(stats_pixel_count, (int, float)):
+                raise ValueError(f"Expected 'pixel_count' in spatial_stats for class '{class_name}' to be a number, got {type(stats_pixel_count)}")
 
-        if secondary_labels:
-            sec_bits = [
-                f"{MapBiomasClasses.CLASS_LABELS.get(n, n)} (about {self._percent(fracs[n])}%)"
-                for n in secondary
-            ]
-            parts.append(f"Secondary classes include {self._format_list(sec_bits)}.")
+            class_pixel_counts[class_name] = int(stats_pixel_count)
+            locs = stats.get("locations")
+            if not isinstance(locs, list):
+                raise ValueError(f"Expected 'locations' in spatial_stats for class '{class_name}' to be a list, got {type(locs)}")
+            class_locs[class_name] = list(locs)
 
-        dom_spatial = spatial_phrases.get(dominant)
-        if dom_spatial:
-            verb = self._verb_for_label(dom_label)
-            parts.append(f"{dom_label.capitalize()} {verb} {dom_spatial}.")
+        # Resolve ownership: each compressed location text is assigned to the class
+        # with the largest pixel count among claimants.
+        loc_claims: Dict[str, Tuple[str, int]] = {}
+        for cname, locs in class_locs.items():
+            for loc in locs:
+                cur = loc_claims.get(loc)
+                if cur is None or class_pixel_counts.get(cname, 0) > cur[1]:
+                    loc_claims[loc] = (cname, class_pixel_counts.get(cname, 0))
 
-        if secondary:
-            for name in secondary[:2]:
-                sec_spatial = spatial_phrases.get(name)
-                if sec_spatial:
-                    sec_label = MapBiomasClasses.CLASS_LABELS.get(name, name)
-                    verb = self._verb_for_label(sec_label)
-                    parts.append(f"{sec_label.capitalize()} {verb} {sec_spatial}.")
+        loc_info: List[str] = []
+        for class_name, _ in classes_to_mention:
+            owned_locs = [loc for loc in class_locs.get(class_name, []) if loc_claims.get(loc, (None, 0))[0] == class_name]
+            if owned_locs:
+                if len(owned_locs) == 1:
+                    phrase = f"{MapBiomasClasses.CLASS_LABELS.get(class_name, class_name)} is mostly in {owned_locs[0]}"
+                else:
+                    phrase = f"{MapBiomasClasses.CLASS_LABELS.get(class_name, class_name)} is mostly in {self._format_list(owned_locs)}"
+            else:
+                # fall back to centroid-based phrasing when no owned compressed locations
+                phrase = self._location_phrase_for_class(class_name, spatial_stats)
+            if phrase:
+                loc_info.append(phrase)
+        second = "" if not loc_info else f"{', '.join(loc_info)}."
 
-        hn = self._entropy_normalized(fracs)
-        if dom_frac >= 0.90 and hn <= 0.15:
-            parts.append("Land cover is highly homogeneous.")
-        elif hn >= 0.65:
-            parts.append("Land cover is highly mixed across classes.")
-        elif hn >= 0.45:
-            parts.append("Land cover is moderately mixed.")
-        else:
-            parts.append("Land cover is slightly mixed.")
+        # 3) Level of mixedness using normalized entropy
+        third = self._mixedness_level(class_fractions)
 
-        caption = " ".join(parts)
+        caption = " ".join([s for s in (first, second, third) if s])
 
-        return caption, {k: float(v) for k, v in fracs.items()}, secondary, spatial_phrases
-
-    # ---- spatial helper methods ----
+        return caption, {k: float(v) for k, v in class_fractions.items()}
 
     @staticmethod
-    def _centroid_location_phrase(stats: SpatialStats) -> Optional[str]:
-        cx = float(stats.centroid_x)
-        cy = float(stats.centroid_y)
+    def _filter_low_presence_classes(
+        ordered: List[Tuple[str, float]],
+    ) ->  List[Tuple[str, float]]:
+        #classes below 5% are usually not worth mentioning, unless they're water or urban (which are more salient even at low presence)
+        classes_to_mention = [
+            (name, frac)
+            for name, frac in ordered
+            if frac >= 0.05 or (name in ("water", "urban") and frac > 0.0)
+        ]
+        return classes_to_mention
+    
+    def _mixedness_level(self, fracs: Dict[str, float]) -> str:
+        mixedness_score = self._entropy_normalized(fracs)
+        if mixedness_score <= 0.15 and fracs and max(fracs.values()) >= 0.90:
+            return "Land cover is highly homogeneous."
+        elif mixedness_score >= 0.65:
+            return "Land cover is highly mixed."
+        elif mixedness_score >= 0.45:
+            return "Land cover is moderately mixed."
+        else:
+            return "Land cover is slightly mixed."
 
-        horiz = None
-        if cx <= 0.33:
-            horiz = "left"
-        elif cx >= 0.67:
-            horiz = "right"
+    @staticmethod
+    def _location_phrase_for_class(
+        name: str,
+        spatial_stats: Dict[str, Optional[Dict[str, float | int | List[str]]]],
+    ) -> str:
+        stats = spatial_stats.get(name)
+        if not stats:
+            return ""
+        
+        stats_centroid_x = stats.get("centroid_x")
+        stats_centroid_y = stats.get("centroid_y")
+        if not isinstance(stats_centroid_x, (int, float)) or not isinstance(stats_centroid_y, (int, float)):
+            raise ValueError(f"Expected 'centroid_x' and 'centroid_y' in spatial_stats for class '{name}' to be numbers, got {type(stats_centroid_x)} and {type(stats_centroid_y)}")
 
-        vert = None
-        if cy <= 0.33:
-            vert = "upper"
-        elif cy >= 0.67:
-            vert = "lower"
+        centroid_x = float(stats_centroid_x)
+        centroid_y = float(stats_centroid_y)
+        horiz_location = PatchCaptionGenerator._horizontal_location(centroid_x)
+        vert_location = PatchCaptionGenerator._vertical_location(centroid_y)
 
-        if horiz and vert:
-            return f"mostly in the {vert}-{horiz}"
-        if horiz:
-            return f"mostly on the {horiz} side"
-        if vert:
-            return f"mostly in the {vert} part"
+        if horiz_location and vert_location:
+            loc = f"mostly in the {vert_location} {horiz_location}"
+        elif horiz_location:
+            loc = f"mostly on the {horiz_location} side"
+        elif vert_location:
+            loc = f"mostly in the {vert_location} part"
+        else:
+            loc = "mostly in the middle"
+
+        label = MapBiomasClasses.CLASS_LABELS.get(name, name)
+        return f"{label} is {loc}"
+
+    @staticmethod
+    def _horizontal_location(centroid_x: float) -> Optional[str]:
+        if centroid_x <= 0.33:
+            return "left"
+        if centroid_x >= 0.67:
+            return "right"
         return None
+
+    @staticmethod
+    def _vertical_location(centroid_y: float) -> Optional[str]:
+        if centroid_y <= 0.33:
+            return "upper"
+        if centroid_y >= 0.67:
+            return "lower"
+        return None
+
 
     @staticmethod
     def _entropy_normalized(fracs: Dict[str, float]) -> float:
@@ -419,68 +289,174 @@ class PatchCaptionGenerator:
             return f"{items[0]} and {items[1]}"
         return ", ".join(items[:-1]) + f", and {items[-1]}"
 
-    @staticmethod
-    def _is_concentrated(stats: SpatialStats, *, spread: Optional[float] = None) -> bool:
-        if spread is None:
-            spread = float(stats.var_x) + float(stats.var_y)
-        return (
-            float(stats.largest_cc_frac) >= 0.60
-            or spread <= 0.05
-            or int(stats.n_cc) <= 3
-        )
+    def _local_entropy(self, lbl: np.ndarray, window: int = 5) -> float:
+        """Compute average normalized Shannon entropy over sliding windows.
 
-    @staticmethod
-    def _counted_structure(structure: str, n_cc: int) -> str:
-        if n_cc <= 5:
-            if structure in {"a few clustered regions", "multiple regions"}:
-                return f"in {n_cc} regions"
-            if structure.startswith("scattered"):
-                return f"scattered in {n_cc} regions"
-        return structure
-
-    @staticmethod
-    def _compute_contact_ratio(
-        class_mask: np.ndarray,
-        lbl: np.ndarray,
-        valid_mask: np.ndarray,
-        class_idx: int,
-    ) -> float:
-        if nd_binary_erosion is not None:
-            eroded = nd_binary_erosion(class_mask, structure=np.ones((3, 3), dtype=bool))
-        else:
-            p = np.pad(class_mask, 1, constant_values=False)
-            eroded = (
-                p[1:-1, 1:-1]
-                & p[:-2, :-2]
-                & p[:-2, 1:-1]
-                & p[:-2, 2:]
-                & p[1:-1, :-2]
-                & p[1:-1, 2:]
-                & p[2:, :-2]
-                & p[2:, 1:-1]
-                & p[2:, 2:]
-            )
-
-        boundary = class_mask & (~eroded)
-        boundary_count = int(boundary.sum())
-        if boundary_count == 0:
+        Uses integral images per class for efficient windowed counts.
+        Returns a normalized entropy in [0,1].
+        """
+        if window <= 1:
             return 0.0
 
-        h, w = class_mask.shape
-        lbl_pad = np.pad(lbl, 1, constant_values=-1)
-        valid_pad = np.pad(valid_mask, 1, constant_values=False)
+        h, w = lbl.shape
+        K = len(MapBiomasClasses.CLASS_NAMES)
 
-        different = np.zeros((h, w), dtype=bool)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                neigh_valid = valid_pad[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
-                neigh_lbl = lbl_pad[1 + dy:1 + dy + h, 1 + dx:1 + dx + w]
-                different |= neigh_valid & (neigh_lbl != class_idx)
+        # prepare padded integral images of shape (h+1, w+1)
+        ws = window
+        pad_h = h + 1
+        pad_w = w + 1
 
-        contact_pixels = boundary & different
-        return float(contact_pixels.sum()) / float(max(boundary_count, 1))
+        valid_mask = (lbl != MapBiomasClasses.IGNORE)
+        total_valid = int(valid_mask.sum())
+        if total_valid == 0:
+            return 0.0
+
+        # build integral image per class
+        int_imgs = []
+        for idx in range(K):
+            arr = (lbl == idx).astype('uint32')
+            # integral image
+            ii = arr.cumsum(axis=0).cumsum(axis=1)
+            # pad to (h+1,w+1)
+            ii_p = np.zeros((pad_h, pad_w), dtype='uint32')
+            ii_p[1:, 1:] = ii
+            int_imgs.append(ii_p)
+
+        # compute sums for windows whose top-left corner ranges
+        # from (0,0) to (h-ws, w-ws)
+        if h < ws or w < ws:
+            # fallback to global entropy of fractions
+            fracs = []
+            for idx in range(K):
+                cnt = int(((lbl == idx) & valid_mask).sum())
+                if cnt > 0:
+                    fracs.append(cnt / total_valid)
+            if not fracs:
+                return 0.0
+            hval = 0.0
+            for p in fracs:
+                hval -= p * math.log(p)
+            return hval / math.log(K) if K > 1 else 0.0
+
+        out_h = h - ws + 1
+        out_w = w - ws + 1
+
+        entropies = np.zeros((out_h, out_w), dtype=float)
+        for idx in range(K):
+            ii = int_imgs[idx]
+            # sum over window: use vectorized ops
+            S = ii[ws:, ws:] - ii[:-ws, ws:] - ii[ws:, :-ws] + ii[:-ws, :-ws]
+            entropies += 0.0  # ensure loop exists; we'll collect counts per class below
+            if idx == 0:
+                counts = S.astype(float)[None, ...]
+            else:
+                counts = np.concatenate((counts, S.astype(float)[None, ...]), axis=0)
+
+        # counts shape: (K, out_h, out_w)
+        counts_sum = counts.sum(axis=0)
+        # avoid division by zero windows
+        mask_nonzero = counts_sum > 0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            fracs = np.divide(counts, counts_sum[None, :, :])
+            # compute entropy per window
+            # ignore zero fractions
+            fpos = np.where(fracs > 0, fracs * np.log(fracs), 0.0)
+            H = -np.sum(fpos, axis=0)
+            H_norm = H / math.log(K) if K > 1 else H
+            # average over non-zero windows
+            if np.any(mask_nonzero):
+                return float(H_norm[mask_nonzero].mean())
+            return 0.0
+    @staticmethod
+    def _compress_locations(cells: List[Tuple[int, int]]) -> List[str]:
+        if not cells:
+            return []
+
+        # Build mapping row -> cols and col -> rows
+        rows_map: Dict[int, List[int]] = {}
+        cols_map: Dict[int, List[int]] = {}
+        cell_set = set(cells)
+        for r, c in sorted(cell_set):
+            rows_map.setdefault(r, []).append(c)
+            cols_map.setdefault(c, []).append(r)
+
+        labels: List[str] = []
+        used: set = set()
+
+        row_names = {0: "upper", 1: "middle", 2: "lower"}
+        col_names = {0: "left", 1: "center", 2: "right"}
+
+        # Prefer row-based compression when a row has at least 2 occupied columns.
+        for r in (0, 1, 2):
+            cols = sorted(set(rows_map.get(r, [])))
+            if not cols:
+                continue
+            if len(cols) == 3:
+                labels.append(f"the {row_names[r]} part")
+                for c in cols:
+                    used.add((r, c))
+            elif len(cols) == 2:
+                # contiguous pairs compress to the nearer corner; non-contiguous -> both corners
+                if cols == [0, 1]:
+                    labels.append(f"the {row_names[r]} left")
+                    used.update({(r, 0), (r, 1)})
+                elif cols == [1, 2]:
+                    labels.append(f"the {row_names[r]} right")
+                    used.update({(r, 1), (r, 2)})
+                else:
+                    # [0,2]
+                    labels.append(f"the {row_names[r]} left")
+                    labels.append(f"the {row_names[r]} right")
+                    used.update({(r, 0), (r, 2)})
+
+        # Then prefer column-based compression for remaining cells
+        for c in (0, 1, 2):
+            rows = sorted(set(cols_map.get(c, [])))
+            remaining_rows = [r for r in rows if (r, c) not in used]
+            if not remaining_rows:
+                continue
+            if len(remaining_rows) == 3:
+                labels.append(f"the {col_names[c]} side")
+                for r in remaining_rows:
+                    used.add((r, c))
+            elif len(remaining_rows) == 2:
+                if remaining_rows == [0, 1]:
+                    labels.append(f"the upper {col_names[c]}")
+                    used.update({(0, c), (1, c)})
+                elif remaining_rows == [1, 2]:
+                    labels.append(f"the lower {col_names[c]}")
+                    used.update({(1, c), (2, c)})
+                else:
+                    labels.append(f"the upper {col_names[c]}")
+                    labels.append(f"the lower {col_names[c]}")
+                    used.update({(0, c), (2, c)})
+
+        # Remaining individual cells -> corner/center labels
+        def _cell_label(row: int, col: int) -> str:
+            vr = row_names.get(row, "middle")
+            hc = col_names.get(col, "center")
+            if vr == "middle" and hc == "center":
+                return "the middle"
+            if vr == "middle":
+                return f"the {hc}"
+            if hc == "center":
+                return f"the {vr} part"
+            return f"the {vr} {hc}"
+
+        for r, c in sorted(cell_set):
+            if (r, c) in used:
+                continue
+            labels.append(_cell_label(r, c))
+
+        # Deduplicate while preserving order
+        seen = set()
+        out: List[str] = []
+        for L in labels:
+            if L not in seen:
+                out.append(L)
+                seen.add(L)
+
+        return out
 
     @staticmethod
     def _update_patch_meta(label_path: Path, caption: dict) -> None:
@@ -506,48 +482,51 @@ class PatchCaptionGenerator:
         processed = 0
         skipped = 0
 
-        def _transform(rec: dict) -> dict:
+        def _transform(record: dict) -> dict:
             nonlocal processed, skipped
 
-            fracs: Dict[str, float] = rec.get("class_fractions") or {}
+            fracs: Dict[str, float] = record.get("class_fractions") or {}
             if not fracs:
                 skipped += 1
-                return rec  # no fractions → nothing to do
+                return record  # no fractions → nothing to do
 
-            label_path = Path(rec["label_path"])
+            label_path = Path(record["label_path"])
 
-            spatial_stats: Dict[str, Optional[Dict[str, float | int]]] = {}
-            spatial_phrases: Dict[str, str] = {}
+            spatial_stats: Dict[str, Optional[Dict[str, float | int | List]]] = {}
 
-            if not self.config.no_spatial:
-                lbl = self._load_label(label_path)
-                valid = (lbl != MapBiomasClasses.IGNORE)
-                valid_pixel_count = int(valid.sum())
-                dominant_class = max(fracs.items(), key=lambda kv: kv[1])[0]
-                dominant_frac = float(fracs[dominant_class])
-                spatial_stats, spatial_phrases = self.compute_spatial_stats(
-                    lbl,
-                    valid_mask=valid,
-                    valid_pixel_count=valid_pixel_count,
-                    dominant_class=dominant_class,
-                    dominant_frac=dominant_frac,
-                )
-
-            caption_text, fracs, secondary, spatial_phrases = self.build_caption(
-                fracs, spatial_phrases
+            
+            lbl = self._load_label(label_path)
+            spatial_stats = self.compute_spatial_stats(
+                lbl,
             )
+
+            caption_text, fracs = self.build_caption(fracs, spatial_stats)
+
+            # spatial local entropy: higher means more spatial scrambling
+            try:
+                local_entropy = float(self._local_entropy(lbl, window=5))
+            except Exception:
+                local_entropy = 0.0
+
+            # append a short spatial-mixedness sentence based on local entropy
+            spatial_phrase = ""
+            if local_entropy >= 0.65:
+                spatial_phrase = "Pixels are highly spatially mixed."
+            elif local_entropy >= 0.45:
+                spatial_phrase = "Pixels are moderately spatially mixed."
+            elif local_entropy >= 0.25:
+                spatial_phrase = "Pixels are slightly spatially mixed."
+
+            if spatial_phrase:
+                caption_text = f"{caption_text} {spatial_phrase}"
+
             caption = {"question": "Describe the image", "answer": caption_text}
 
-            dominant_class = max(fracs.items(), key=lambda kv: kv[1])[0]
-            dominant_fraction = float(fracs[dominant_class])
-
-            rec["caption"] = caption
-            rec["caption_meta"] = {
-                "dominant_class": dominant_class,
-                "dominant_fraction": dominant_fraction,
-                "secondary_classes": secondary,
-                "spatial_phrases": spatial_phrases,
+            record["caption"] = caption
+            # caption_meta no longer contains dominant/secondary fields — keep spatial_stats only
+            record["caption_meta"] = {
                 "spatial_stats": spatial_stats,
+                "local_entropy": local_entropy,
             }
 
             # Mirror caption into per-patch meta.json
@@ -556,7 +535,7 @@ class PatchCaptionGenerator:
             processed += 1
             if processed % 2000 == 0:
                 print(f"[captions] processed={processed}")
-            return rec
+            return record
 
         written = self.index_builder.update_records(_transform)
         print(f"[captions] Done. processed={processed}, skipped={skipped}, index_records={written}")
