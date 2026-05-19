@@ -12,6 +12,7 @@ from PatchIndexBuilder import PatchIndexBuilder
 from PatchCaptionGenerator import PatchCaptionGenerator
 from PatchQAGenerator import PatchQAGenerator
 from GroundingAnswerBuilder import GroundingStage, GroundingConfig
+from NDVIBandGenerator import NDVIBandGenerator
 
 @dataclass(frozen=True)
 class SceneConfig:
@@ -148,6 +149,7 @@ class RegionPipeline:
       6. Generate captions
       7. Generate QA
       8. Generate grounding
+      9. Add NDVI bands
 
     This class is intentionally thin: it just wires together existing
     step-specific classes/commands in scripts/pipeline.
@@ -248,18 +250,23 @@ class RegionPipeline:
         )
         stage.run()
 
+    def add_ndvi_bands(self) -> None:
+        generator = NDVIBandGenerator(patch_root=self.region_path.tiles_dir)
+        generator.run()
+
     # ---- composite runners ----
 
     def run_all(self, *, with_augmentation: bool = True) -> None:
         """Run the full pipeline chain for this region/year."""
 
         self.region_path = self._paths()
-        # self.tile_scene()
-        # self.add_raw_labels()
-        # self.remap_labels()
-        # if with_augmentation:
-        #     self.augment_patches()
+        """ self.tile_scene()
+        self.add_raw_labels()
+        self.remap_labels()
+        if with_augmentation:
+            self.augment_patches() """
         index_builder = self.build_index()
         self.generate_captions(index_builder=index_builder)
-        self.generate_qa(index_builder=index_builder)
+        """ self.generate_qa(index_builder=index_builder)
         self.generate_grounding(index_builder=index_builder)
+        self.add_ndvi_bands() """
