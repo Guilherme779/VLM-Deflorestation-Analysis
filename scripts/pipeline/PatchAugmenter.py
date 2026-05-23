@@ -143,26 +143,18 @@ class PatchAugmenter:
         raise ValueError(f"Expected 2D or 3D array, got shape={arr.shape}")
 
     def _rotate_transform(self, transform: Affine, height: int, width: int, angle: int) -> Affine:
-        """Return new transform after rotating the pixel grid by angle degrees.
+        """Return a north-up transform for the rotated raster.
 
-        Angle must be one of {90, 180, 270}. We keep the same world footprint.
+        The mathematically exact rotated transform produces off-diagonal affines
+        (90°/270°) or negative pixel scales (180°) that QGIS cannot render
+        correctly (pixelated or invisible). For augmentation the rotated patches
+        are independent training samples, so we preserve the original north-up
+        scale and upper-left origin unchanged — only the pixel arrays are rotated.
         """
-
         angle = angle % 360
         if angle not in {90, 180, 270}:
             raise ValueError(f"Unsupported rotation angle: {angle}")
-
-        if angle == 90:
-            # new[r, c] = old[H-1-c, r]
-            m = Affine(0, 1, 0, -1, 0, height - 1)
-            return transform * m
-        if angle == 180:
-            # new[r, c] = old[H-1-r, W-1-c]
-            m = Affine(-1, 0, width - 1, 0, -1, height - 1)
-            return transform * m
-        # angle == 270 (or -90): new[r, c] = old[c, W-1-r]
-        m = Affine(0, -1, width - 1, 1, 0, 0)
-        return transform * m
+        return Affine(transform.a, 0.0, transform.c, 0.0, transform.e, transform.f)
 
     def _rotate_geotiff(self, src_path: Path, dst_path: Path, *, angle: int) -> None:
         if dst_path.exists() and not self.overwrite:
