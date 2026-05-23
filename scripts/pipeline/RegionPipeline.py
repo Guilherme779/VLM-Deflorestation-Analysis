@@ -218,12 +218,12 @@ class RegionPipeline:
         index_builder.run()
         return index_builder
 
-    def generate_captions(self, *, index_builder: PatchIndexBuilder) -> None:
+    def generate_captions(self, *, index_builder: PatchIndexBuilder, workers: int = 1) -> None:
         generator = PatchCaptionGenerator(
             patch_root=self.region_path.tiles_dir,
             index_builder=index_builder,
         )
-        generator.run()
+        generator.run(workers=workers)
 
     def generate_qa(self, *, index_builder: PatchIndexBuilder) -> None:
         gen = PatchQAGenerator(
@@ -256,7 +256,7 @@ class RegionPipeline:
 
     # ---- composite runners ----
 
-    def run_all(self, *, with_augmentation: bool = True) -> None:
+    def run_all(self, *, with_augmentation: bool = True, caption_workers: int = 1) -> None:
         """Run the full pipeline chain for this region/year."""
 
         self.region_path = self._paths()
@@ -266,7 +266,8 @@ class RegionPipeline:
         if with_augmentation:
             self.augment_patches() """
         index_builder = self.build_index()
-        self.generate_captions(index_builder=index_builder)
+        self.generate_captions(index_builder=index_builder, workers=caption_workers)
         """ self.generate_qa(index_builder=index_builder)
         self.generate_grounding(index_builder=index_builder)
-        self.add_ndvi_bands() """
+        self.add_ndvi_bands()
+ """

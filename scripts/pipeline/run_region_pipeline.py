@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 """CLI entrypoint to run the RegionPipeline for one or more regions.
 
 Example:
@@ -44,13 +48,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Overwrite existing rotated patch folders/files if present.",
     )
 
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Repository root path. Defaults to auto-detection via find_repo_root.",
+    )
+
+    parser.add_argument(
+        "--caption-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for patch captioning (default: 1).",
+    )
+
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    repo_root = find_repo_root(Path(__file__))
+    repo_root = args.root.resolve() if args.root else find_repo_root(Path(__file__))
     scenes_dir = repo_root / "data" / "scenes"
     available_regions = infer_regions_available(scenes_dir)
 
@@ -90,7 +108,10 @@ def main(argv: list[str] | None = None) -> int:
             augment_suffix=str(args.augment_suffix),
             augment_overwrite=bool(args.augment_overwrite),
         )
-        pipeline.run_all(with_augmentation=not bool(args.no_augment))
+        pipeline.run_all(
+            with_augmentation=not bool(args.no_augment),
+            caption_workers=args.caption_workers,
+        )
 
     return 0
 
