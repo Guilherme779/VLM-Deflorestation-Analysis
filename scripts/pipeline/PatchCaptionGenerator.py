@@ -47,21 +47,46 @@ class PatchCaptionGenerator:
         img_path: Path,
         min_fraction: float = 0.003,
         max_fraction: float = 0.08,
+        min_aspect: float = 4.0,
+        max_blob_frac: float = 0.02,
     ) -> bool:
-        """Detect road presence via per-band brightness outlier analysis.
+        """Detect road presence via per-band brightness and linearity analysis.
 
-        Roads in Amazonian Sentinel-2 imagery appear as very bright linear
-        features in all visible bands.  We compute the 99th-percentile threshold
-        for each of the first three bands and count pixels that exceed all three
-        simultaneously.  A fraction in [min_fraction, max_fraction] indicates a
-        road network rather than noise or a uniformly bright clearing.
+        Roads in Amazonian Sentinel-2 imagery appear as very bright, thin,
+        elongated features in all visible bands. Clouds are also very bright
+        but form large, compact blobs.
+
+        After finding bright pixels (top 1% in all RGB bands simultaneously),
+        we inspect each connected component:
+          - Skip tiny noise (< 15 px)
+          - Skip large blobs (> 2% of image pixels) — these are clouds
+          - If any remaining component has aspect ratio >= 4 → road detected
         """
         with rasterio.open(img_path) as src:
             rgb = src.read([1, 2, 3]).astype(np.float32)
         thresholds = np.array([np.percentile(rgb[i], 99) for i in range(3)])
         bright = np.all(rgb > thresholds[:, None, None], axis=0)
         frac = float(bright.mean())
-        return min_fraction <= frac <= max_fraction
+        if not (min_fraction <= frac <= max_fraction):
+            return False
+
+        # Shape filter: require at least one thin, elongated bright component.
+        labeled, n_comp = _ndlabel(bright)
+        total_pixels = bright.size
+        for comp_id in range(1, n_comp + 1):
+            comp = labeled == comp_id
+            size = int(comp.sum())
+            if size < 15:
+                continue
+            if size > total_pixels * max_blob_frac:
+                continue
+            ys, xs = np.where(comp)
+            h = int(ys.max() - ys.min() + 1)
+            w = int(xs.max() - xs.min() + 1)
+            aspect = max(h, w) / max(min(h, w), 1)
+            if aspect >= min_aspect:
+                return True
+        return False
 
     @staticmethod
     def _count_components(mask: np.ndarray, min_size: int = 9) -> Tuple[int, float]:
@@ -96,63 +121,53 @@ class PatchCaptionGenerator:
         centroid_y = float(ys.mean()) / max(H - 1, 1)
         centroid_x = float(xs.mean()) / max(W - 1, 1)
 
-        # Build 5-region map: center is the middle ~1/3 in both dimensions;
-        # quadrants (upper-left=0, upper-right=1, lower-left=2, lower-right=3) fill the rest.
-        cy_lo, cy_hi = H // 3, (2 * H + 2) // 3
-        cx_lo, cx_hi = W // 3, (2 * W + 2) // 3
-        half_y, half_x = H // 2, W // 2
-
+        # 3x3 grid: cell index = row*3 + col  (row 0=top, col 0=left)
         ys_2d = np.arange(H)[:, None]
         xs_2d = np.arange(W)[None, :]
-        is_center = (ys_2d >= cy_lo) & (ys_2d < cy_hi) & (xs_2d >= cx_lo) & (xs_2d < cx_hi)
-        region_map = np.where(
-            is_center, 4,
-            np.where(ys_2d < half_y,
-                np.where(xs_2d < half_x, 0, 1),
-                np.where(xs_2d < half_x, 2, 3),
-            ),
-        ).astype(np.int32)
+        y_cells = np.clip(ys_2d * 3 // max(H, 1), 0, 2)
+        x_cells = np.clip(xs_2d * 3 // max(W, 1), 0, 2)
+        cell_map = (y_cells * 3 + x_cells).astype(np.int32)
 
-        region_totals = np.bincount(region_map.ravel(), minlength=5)
-        class_in_region = np.bincount(region_map[mask].ravel(), minlength=5)
+        region_totals = np.bincount(cell_map.ravel(), minlength=9)
+        class_in_region = np.bincount(cell_map[mask].ravel(), minlength=9)
 
-        # Only consider a region present if the class covers >= 2.5% of that region
+        # Only include cells where the class covers >= 2.5% of that cell's pixels
         MIN_REGION_FRACTION = 0.025
-        present_regions = [
-            r for r in range(5)
-            if region_totals[r] > 0 and (class_in_region[r] / region_totals[r]) >= MIN_REGION_FRACTION
+        present_cells = [
+            i for i in range(9)
+            if region_totals[i] > 0 and (class_in_region[i] / region_totals[i]) >= MIN_REGION_FRACTION
         ]
 
-        # Greedily pick dominant regions until 65% of class pixels are covered
+        # Greedily pick dominant cells until 65% of class pixels are covered
         COVERAGE_TARGET = 0.65
-        present_by_count = sorted(present_regions, key=lambda r: class_in_region[r], reverse=True)
+        present_by_count = sorted(present_cells, key=lambda i: class_in_region[i], reverse=True)
         cumulative = 0.0
-        dominant_region_ids: List[int] = []
-        for r in present_by_count:
-            dominant_region_ids.append(r)
-            cumulative += class_in_region[r] / pixel_count
+        dominant_cells: List[int] = []
+        for i in present_by_count:
+            dominant_cells.append(i)
+            cumulative += class_in_region[i] / pixel_count
             if cumulative >= COVERAGE_TARGET:
                 break
 
-        dominant_set = set(dominant_region_ids)
+        dominant_set = set(dominant_cells)
 
-        # Drop scattered regions that are adjacent to a dominant one — a small
-        # presence next to a dominant neighbour is likely spillover, not a
-        # separate cluster worth mentioning.
-        ADJACENT: Dict[int, set] = {
-            0: {1, 2, 4},
-            1: {0, 3, 4},
-            2: {0, 3, 4},
-            3: {1, 2, 4},
-            4: {0, 1, 2, 3},
-        }
-        scattered_region_ids = [
-            r for r in present_by_count
-            if r not in dominant_set and not (ADJACENT[r] & dominant_set)
+        # Drop scattered cells adjacent to a dominant one — likely spillover.
+        # Adjacency = edge-sharing only (no diagonals).
+        def _neighbors(idx: int) -> set:
+            r, c = divmod(idx, 3)
+            return {
+                (r + dr) * 3 + (c + dc)
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))
+                if 0 <= r + dr < 3 and 0 <= c + dc < 3
+            }
+
+        scattered_cells = [
+            i for i in present_by_count
+            if i not in dominant_set and not (_neighbors(i) & dominant_set)
         ]
 
-        locations = self._compress_locations(dominant_region_ids)
-        scattered_locations = self._compress_locations(scattered_region_ids)
+        locations = self._compress_locations([(i // 3, i % 3) for i in dominant_cells])
+        scattered_locations = self._compress_locations([(i // 3, i % 3) for i in scattered_cells])
 
         fragment_count, largest_fragment_fraction = self._count_components(mask)
 
@@ -283,36 +298,98 @@ class PatchCaptionGenerator:
         return ", ".join(items[:-1]) + f", and {items[-1]}"
 
     @staticmethod
-    def _compress_locations(region_ids: List[int]) -> List[str]:
-        """Compress 5-region IDs into readable strings using overlapping labels.
+    def _compress_locations(cells: List[Tuple[int, int]]) -> List[str]:
+        """Compress 3x3 grid (row, col) cell list into readable location strings.
 
-        Region IDs: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right, 4=center.
-        Three-corner sets use two overlapping pair labels (e.g. {0,1,3} → top + right).
+        Row 0=top, 1=middle, 2=bottom. Col 0=left, 1=center, 2=right.
+        Multi-pass: full rows → full columns → partial rows → partial columns → singles.
         """
-        CORNER_LABELS: Dict[frozenset, List[str]] = {
-            frozenset():          [],
-            frozenset({0}):       ["the top left"],
-            frozenset({1}):       ["the top right"],
-            frozenset({2}):       ["the bottom left"],
-            frozenset({3}):       ["the bottom right"],
-            frozenset({0, 1}):    ["the top part"],
-            frozenset({2, 3}):    ["the bottom part"],
-            frozenset({0, 2}):    ["the left side"],
-            frozenset({1, 3}):    ["the right side"],
-            frozenset({0, 3}):    ["the top left", "the bottom right"],
-            frozenset({1, 2}):    ["the top right", "the bottom left"],
-            frozenset({0, 1, 2}): ["the top part", "the left side"],
-            frozenset({0, 1, 3}): ["the top part", "the right side"],
-            frozenset({0, 2, 3}): ["the bottom part", "the left side"],
-            frozenset({1, 2, 3}): ["the bottom part", "the right side"],
-            frozenset({0,1,2,3}): ["the top part", "the bottom part"],
-        }
-        ids = set(region_ids)
-        corners = frozenset(ids & {0, 1, 2, 3})
-        labels = list(CORNER_LABELS[corners])
-        if 4 in ids:
-            labels.append("the center")
-        return labels
+        if not cells:
+            return []
+
+        row_names = {0: "top", 1: "middle", 2: "bottom"}
+        col_names = {0: "left", 1: "center", 2: "right"}
+
+        rows_map: Dict[int, List[int]] = {}
+        cols_map: Dict[int, List[int]] = {}
+        cell_set = set(cells)
+        for r, c in sorted(cell_set):
+            rows_map.setdefault(r, []).append(c)
+            cols_map.setdefault(c, []).append(r)
+
+        labels: List[str] = []
+        used: set = set()
+
+        # Pass 1: full rows (all 3 columns)
+        for r in (0, 1, 2):
+            if len(set(rows_map.get(r, []))) == 3:
+                labels.append(f"the {row_names[r]} part")
+                for c in range(3):
+                    used.add((r, c))
+
+        # Pass 2: full columns (all 3 rows) for remaining cells
+        for c in (0, 1, 2):
+            remaining = [r for r in cols_map.get(c, []) if (r, c) not in used]
+            if len(set(remaining)) == 3:
+                label = "the center" if c == 1 else f"the {col_names[c]} side"
+                labels.append(label)
+                for r in range(3):
+                    used.add((r, c))
+
+        # Pass 3: partial rows (2 contiguous columns)
+        for r in (0, 1, 2):
+            cols = sorted(c for c in rows_map.get(r, []) if (r, c) not in used)
+            if len(cols) == 2:
+                if cols == [0, 1]:
+                    labels.append(f"the {row_names[r]} left")
+                    used.update({(r, 0), (r, 1)})
+                elif cols == [1, 2]:
+                    labels.append(f"the {row_names[r]} right")
+                    used.update({(r, 1), (r, 2)})
+                else:  # [0, 2] non-contiguous
+                    labels.append(f"the {row_names[r]} left")
+                    labels.append(f"the {row_names[r]} right")
+                    used.update({(r, 0), (r, 2)})
+
+        # Pass 4: partial columns (2 contiguous rows) for remaining cells
+        for c in (0, 1, 2):
+            rows = sorted(r for r in cols_map.get(c, []) if (r, c) not in used)
+            if len(rows) == 2:
+                col_label = "center" if c == 1 else col_names[c]
+                if rows == [0, 1]:
+                    labels.append(f"the top {col_label}")
+                    used.update({(0, c), (1, c)})
+                elif rows == [1, 2]:
+                    labels.append(f"the bottom {col_label}")
+                    used.update({(1, c), (2, c)})
+                else:  # [0, 2] non-contiguous
+                    labels.append(f"the top {col_label}")
+                    labels.append(f"the bottom {col_label}")
+                    used.update({(0, c), (2, c)})
+
+        # Pass 5: remaining individual cells
+        def _cell_label(r: int, c: int) -> str:
+            vr, hc = row_names[r], col_names[c]
+            if vr == "middle" and hc == "center":
+                return "the middle"
+            if vr == "middle":
+                return f"the {hc}"
+            if hc == "center":
+                return f"the {vr} center"
+            return f"the {vr} {hc}"
+
+        for r, c in sorted(cell_set):
+            if (r, c) not in used:
+                labels.append(_cell_label(r, c))
+
+        # Deduplicate preserving order
+        seen: set = set()
+        out: List[str] = []
+        for L in labels:
+            if L not in seen:
+                out.append(L)
+                seen.add(L)
+        return out
 
     @staticmethod
     def _update_patch_meta(label_path: Path, caption: dict) -> None:
